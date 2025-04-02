@@ -22,6 +22,7 @@ SERVER_IP = config['Configuration']['SERVER_IP']
 MEM_TOOL_PORT = int(config['Configuration']['MEM_TOOL_PORT'])
 VERSION = config['Configuration']['VERSION']
 AUTH_SERVICE_URL = config['Configuration']['AUTH_SERVICE_URL']
+SQUAD_PROCESS_NAME = config['Configuration']['SQUAD_PROCESS_NAME']
 
 current_token = None
 memory_config_received = False  # 新增标志，用于标记是否已从服务器接收到内存配置
@@ -73,6 +74,7 @@ class MemoryReader:
         self.base_address = None
         
         self.initial_offset = None
+        self.process_name = SQUAD_PROCESS_NAME
         self.team_offsets = {
             1: None,
             2: None
@@ -116,7 +118,7 @@ class MemoryReader:
         logging.debug("开始查找 SquadGameServer.exe 进程...") # Start list squad process
         for proc in psutil.process_iter(['pid', 'name', 'exe']):
             try:
-                if proc.info['name'] == 'SquadGameServer.exe':
+                if proc.info['name'] == self.process_name:
                     proc_path = os.path.normpath(proc.info['exe']).lower()
                     proc_dir = os.path.dirname(proc_path)
                     logging.debug(f"{messages_zh['Found SquadGameServer.exe process']}: PID {proc.info['pid']}, Path {proc_path}")
@@ -170,7 +172,7 @@ class MemoryReader:
                     return False
             self.pm = pymem.Pymem()
             self.pm.open_process_from_id(self.selected_pid)
-            module = pymem.process.module_from_name(self.pm.process_handle, "SquadGameServer.exe")
+            module = pymem.process.module_from_name(self.pm.process_handle,  self.process_name)
             if not module:
                 raise Exception(messages_zh["Could not find SquadGameServer.exe module"])
             self.base_address = module.lpBaseOfDll
