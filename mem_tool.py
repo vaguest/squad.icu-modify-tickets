@@ -1,3 +1,6 @@
+import json
+import socket
+
 import psutil
 from flask import Flask, request, jsonify
 import threading
@@ -23,56 +26,20 @@ MEM_TOOL_PORT = int(config['Configuration']['MEM_TOOL_PORT'])
 VERSION = config['Configuration']['VERSION']
 AUTH_SERVICE_URL = config['Configuration']['AUTH_SERVICE_URL']
 SQUAD_PROCESS_NAME = config['Configuration']['SQUAD_PROCESS_NAME']
+COMMUNICATION_MODE = config['Configuration'].get('COMMUNICATION_MODE', 'http').lower()
+SOCKET_PORT = int(config['Configuration'].get('SOCKET_PORT', 9090))
+PROCESS_CHECK_INTERVAL = int(config['Configuration'].get('PROCESS_CHECK_INTERVAL', 30))  # 进程检查间隔，默认30秒
 
 current_token = None
 memory_config_received = False  # 新增标志，用于标记是否已从服务器接收到内存配置
-
-# Chinese message mapping
-messages_zh = {
-    "Heartbeat successful, token updated": "心跳成功，令牌已更新",
-    "Heartbeat failed": "心跳失败",
-    "Connection error": "连接错误",
-    "Failed to read memory at": "读取内存失败，地址：",
-    "Failed to write memory at": "写入内存失败，地址：",
-    "Value updated successfully": "数值更新成功",
-    "Unauthorized": "未授权",
-    "Missing required parameters": "缺少必要参数",
-    "Invalid team number": "队伍号码无效",
-    "No SquadGameServer.exe process found in current directory": "在当前目录下未找到 SquadGameServer.exe 进程",
-    "Multiple SquadGameServer.exe processes found": "找到多个 SquadGameServer.exe 进程",
-    "Selected SquadGameServer.exe process": "已选择 SquadGameServer.exe 进程",
-    "Base address": "基址",
-    "Error accessing process": "访问进程时出错",
-    "Updated initial_offset to": "初始偏移已更新为",
-    "Updated offsets for team": "队伍偏移已更新",
-    "Error updating memory config": "更新内存配置错误",
-    "Memory configuration updated successfully": "内存配置更新成功",
-    "Failed to update memory configuration": "内存配置更新失败",
-    "initial_addr": "初始地址",
-    "Invalid value provided": "提供的值无效",
-    "Value must be positive": "值必须为正数",
-    "Missing team parameter": "缺少队伍参数",
-    "Array must contain at least two elements": "数组必须至少包含两个元素",
-    "No solution found": "未找到解决方案",
-    "Error in set_ticket": "设置票数时出错",
-    "Error in get_ticket": "获取票数时出错",
-    "Failed to initialize connection to game process": "初始化游戏进程连接失败",
-    "Current directory": "当前目录",
-    "Found SquadGameServer.exe process": "发现 SquadGameServer.exe 进程",
-    "Matched SquadGameServer.exe process": "匹配 SquadGameServer.exe 进程",
-    "Could not find SquadGameServer.exe module": "无法找到 SquadGameServer.exe 模块",
-    "Value must be positive integer": "值必须为正整数",
-    "Team must be 1 or 2": "队伍必须为 1 或 2",
-    "Memory configuration not received yet": "尚未接收到内存配置",
-    "Waiting for memory configuration from server": "正在等待从服务器获取内存配置",
-}
+process_monitoring_active = True  # 用于控制进程监控线程
 
 
 class MemoryReader:
     def __init__(self):
         self.pm = None
         self.base_address = None
-        
+
         self.initial_offset = None
         self.process_name = SQUAD_PROCESS_NAME
         self.team_offsets = {
@@ -81,18 +48,17 @@ class MemoryReader:
         }
         self.selected_pid = None
         self.current_dir = os.path.normpath(os.getcwd()).lower()
-        logging.info(f"{messages_zh['Current directory']}: {self.current_dir}")
+        self.connection_lock = threading.Lock()  # 添加锁，防止并发访问连接状态
+        print(f"{['Current directory']}: {self.current_dir}")
 
     def update_memory_config(self, memory_config):
         try:
-            logging.info("开始更新内存配置...")  # Start update memory config
             if "initial_offset" in memory_config:
                 offset_str = memory_config["initial_offset"]
                 if isinstance(offset_str, str) and offset_str.startswith("0x"):
                     self.initial_offset = int(offset_str, 16)
                 else:
                     self.initial_offset = int(offset_str)
-                logging.info(f"{messages_zh['Updated initial_offset to']}: 0x{self.initial_offset:x}")
 
             if "team_offsets" in memory_config:
                 for team, offsets in memory_config["team_offsets"].items():
@@ -104,86 +70,118 @@ class MemoryReader:
                         else:
                             parsed_offsets.append(int(offset))
                     self.team_offsets[team_num] = parsed_offsets
-                    logging.info(f"{messages_zh['Updated offsets for team']} {team_num}: {[hex(o) for o in parsed_offsets]}")
-            logging.info("内存配置更新完成。")  # Memory config updated complete
+
+            print("内存配置更新完成。")  # Memory config updated complete
             global memory_config_received
             memory_config_received = True
             return True
         except Exception as e:
-            logging.error(f"{messages_zh['Error updating memory config']}: {str(e)}")
+            print(f"['Error updating memory config']: {str(e)}")
             return False
 
     def list_squad_processes(self):
         squad_processes = []
-        logging.debug("开始查找 SquadGameServer.exe 进程...") # Start list squad process
+        logging.debug("开始查找 SquadGameServer.exe 进程...")  # Start list squad process
         for proc in psutil.process_iter(['pid', 'name', 'exe']):
             try:
                 if proc.info['name'] == self.process_name:
                     proc_path = os.path.normpath(proc.info['exe']).lower()
                     proc_dir = os.path.dirname(proc_path)
-                    logging.debug(f"{messages_zh['Found SquadGameServer.exe process']}: PID {proc.info['pid']}, Path {proc_path}")
+                    logging.debug(
+                        f"Found SquadGameServer.exe process: PID {proc.info['pid']}, Path {proc_path}")
                     if proc_dir == self.current_dir:
                         squad_processes.append({'pid': proc.info['pid'], 'directory': proc_dir})
-                        logging.info(f"{messages_zh['Matched SquadGameServer.exe process']}: PID {proc.info['pid']}")
+                        print(f"Matched SquadGameServer.exe process: PID {proc.info['pid']}")
             except (psutil.NoSuchProcess, psutil.AccessDenied, Exception) as e:
-                logging.error(f"{messages_zh['Error accessing process']}: {str(e)}")
+                print(f"'Error accessing process: {str(e)}")
                 continue
         if not squad_processes:
-            logging.info("未找到匹配的 SquadGameServer.exe 进程。") # No matched squad process found
+            print("未找到匹配的 SquadGameServer.exe 进程。")  # No matched squad process found
         else:
-            logging.info(f"共找到 {len(squad_processes)} 个 SquadGameServer.exe 进程。") # Found count squad process
+            print(f"共找到 {len(squad_processes)} 个 SquadGameServer.exe 进程。")  # Found count squad process
         return squad_processes
 
     def select_process(self):
-        logging.info("开始选择进程...") # Start select process
+        print("开始选择进程...")  # Start select process
         processes = self.list_squad_processes()
         if not processes:
-            error_msg = messages_zh["No SquadGameServer.exe process found in current directory"]
-            logging.error(f"{error_msg}: {self.current_dir}")
+            error_msg = "No SquadGameServer.exe process found in current directory"
+            print(f"{error_msg}: {self.current_dir}")
             raise Exception(error_msg)
         if len(processes) > 1:
-            logging.warning(f"{messages_zh['Multiple SquadGameServer.exe processes found']}: {len(processes)}，选择第一个。") # Multiple squad process found, select first one
+            logging.warning(
+                f"Multiple SquadGameServer.exe processes found: {len(processes)}，选择第一个。")  # Multiple squad process found, select first one
             self.selected_pid = processes[0]['pid']
         else:
             self.selected_pid = processes[0]['pid']
-        logging.info(f"{messages_zh['Selected SquadGameServer.exe process']}: PID {self.selected_pid}")
+        print(f"Selected SquadGameServer.exe process: PID {self.selected_pid}")
         return True
 
     def check_config_received(self):
         if not memory_config_received or self.initial_offset is None or not all(self.team_offsets.values()):
-            logging.error(messages_zh["Memory configuration not received yet"])
-            raise Exception(messages_zh["Waiting for memory configuration from server"])
+            print("Memory configuration not received yet")
+            raise Exception("Waiting for memory configuration from server")
         return True
 
     def get_offsets(self, team):
         self.check_config_received()
-        
+        print("get_offsets, team:", team)
+        team = int(team)
         if team not in [1, 2]:
-            raise ValueError(messages_zh["Team must be 1 or 2"])
+            raise ValueError("Team must be 1 or 2")
         if not self.team_offsets[team]:
-            raise Exception(messages_zh["Memory configuration not received yet"])
+            raise Exception("Memory configuration not received yet")
         return self.team_offsets[team]
 
-    def connect(self):
-        logging.info("尝试连接到游戏进程...") # Trying to connect game process
-        try:
-            if not self.selected_pid:
-                if not self.select_process():
-                    return False
-            self.pm = pymem.Pymem()
-            self.pm.open_process_from_id(self.selected_pid)
-            module = pymem.process.module_from_name(self.pm.process_handle,  self.process_name)
-            if not module:
-                raise Exception(messages_zh["Could not find SquadGameServer.exe module"])
-            self.base_address = module.lpBaseOfDll
-            logging.info("{}: 0x{:x}".format(messages_zh['Base address'], self.base_address))
-            logging.info("连接游戏进程成功。") # Connect game process success
-            return True
-        except Exception as e:
-            logging.error(f"{messages_zh['Connection error']}: {str(e)}")
-            logging.error("连接游戏进程失败。") # Connect game process failed
-            self.selected_pid = None
+    def is_process_alive(self):
+        """检查当前选择的进程是否存在并且运行"""
+        if not self.selected_pid:
             return False
+        try:
+            process = psutil.Process(self.selected_pid)
+            return process.is_running() and process.name() == self.process_name
+        except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
+            return False
+
+    def connect(self):
+        with self.connection_lock:
+            print("尝试连接到游戏进程...")  # Trying to connect game process
+            try:
+                if not self.selected_pid or not self.is_process_alive():
+                    if not self.select_process():
+                        return False
+
+                # 关闭现有的连接
+                if self.pm:
+                    try:
+                        self.pm.close_process()
+                    except:
+                        pass
+                    self.pm = None
+                    self.base_address = None
+
+                self.pm = pymem.Pymem()
+                self.pm.open_process_from_id(self.selected_pid)
+                module = pymem.process.module_from_name(self.pm.process_handle, self.process_name)
+                if not module:
+                    raise Exception("Could not find SquadGameServer.exe module")
+                self.base_address = module.lpBaseOfDll
+                print("连接游戏进程成功。")  # Connect game process success
+                return True
+            except Exception as e:
+                print(f"Connection error: {str(e)}")
+                print("连接游戏进程失败。")  # Connect game process failed
+                self.selected_pid = None
+                self.pm = None
+                self.base_address = None
+                return False
+
+    def ensure_connection(self):
+        """确保连接到游戏进程，如果没有连接或进程已退出，则尝试重新连接"""
+        if not self.pm or not self.base_address or not self.is_process_alive():
+            logging.warning("Process not found or exited, trying to reconnect")
+            return self.connect()
+        return True
 
     def follow_pointers(self, initial_addr, offsets):
         addr = initial_addr
@@ -191,67 +189,69 @@ class MemoryReader:
             try:
                 ptr = self.pm.read_ulonglong(addr)
                 addr = ptr + offset
-                logging.debug(f"指针层级 {i+1}, 地址: 0x{addr:x}, 偏移: 0x{offset:x}") # Pointer level info
             except pymem.exception.MemoryReadError:
-                error_msg = f"{messages_zh['Failed to read memory at']} 0x{addr:x} (offset level {i + 1})"
-                logging.error(error_msg)
+                error_msg ="Failed to read memory"
+                print(error_msg)
                 raise Exception(error_msg)
         return addr
 
     def get_ticket_value(self, team):
-        logging.info(f"尝试获取队伍 {team} 的票数...") # Trying to get team ticket value
-        
+        print(f"尝试获取队伍 {team} 的票数...")  # Trying to get team ticket value
+
         # 确保已从服务器接收到配置
         self.check_config_received()
-        
-        if not self.pm:
-            if not self.connect():
-                raise Exception("Failed to connect to process") # Already logged in connect()
+
+        # 确保连接到游戏进程
+        if not self.ensure_connection():
+            raise Exception("Failed to connect to process")  # Already logged in connect()
+
         try:
             offsets = self.get_offsets(team)
         except ValueError as e:
-            raise Exception(str(e)) # Message from get_offsets is already Chinese
+            raise Exception(str(e))  # Message from get_offsets is already Chinese
+
         initial_addr = self.base_address + self.initial_offset
-        logging.info("{}: 0x{:x}".format(messages_zh['initial_addr'], initial_addr))
         target_addr = self.follow_pointers(initial_addr, offsets)
         try:
             value = self.pm.read_ulonglong(target_addr)
-            logging.info(f"队伍 {team} 的票数为: {value}") # Team ticket value is
+            print(f"队伍 {team} 的票数为: {value}")  # Team ticket value is
             return value
         except pymem.exception.MemoryReadError:
-            error_msg = f"{messages_zh['Failed to read memory at']} 0x{target_addr:x}"
-            logging.error(error_msg)
+            error_msg = "Failed to read memory"
+            print(error_msg)
             raise Exception(error_msg)
 
     def set_ticket_value(self, team, new_value):
-        logging.info(f"尝试设置队伍 {team} 的票数为: {new_value}...") # Trying to set team ticket value
-        
+        print(f"尝试设置队伍 {team} 的票数为: {new_value}...")  # Trying to set team ticket value
+        team = int(team)
+        new_value = int(new_value)
         # 确保已从服务器接收到配置
         self.check_config_received()
-        
-        if not self.pm:
-            if not self.connect():
-                raise Exception("Failed to connect to process") # Already logged in connect()
+
+        # 确保连接到游戏进程
+        if not self.ensure_connection():
+            raise Exception("Failed to connect to process")  # Already logged in connect()
+
         try:
             offsets = self.get_offsets(team)
         except ValueError as e:
-            raise Exception(str(e)) # Message from get_offsets is already Chinese
+            raise Exception(str(e))  # Message from get_offsets is already Chinese
         try:
             new_value = int(new_value)
             if new_value < 0:
-                raise ValueError(messages_zh["Value must be positive"])
+                raise ValueError("Value must be positive")
         except ValueError:
-            raise Exception(messages_zh["Invalid value provided"])
+            raise Exception("Invalid value provided")
         initial_addr = self.base_address + self.initial_offset
-        logging.info("{}: 0x{:x}".format(messages_zh['initial_addr'], initial_addr))
+
         target_addr = self.follow_pointers(initial_addr, offsets)
         try:
             self.pm.write_ulonglong(target_addr, new_value)
-            logging.info(f"队伍 {team} 的票数已设置为: {new_value}") # Team ticket value set to
+            print(f"队伍 {team} 的票数已设置为: {new_value}")  # Team ticket value set to
             return True
         except pymem.exception.MemoryWriteError:
-            error_msg = f"{messages_zh['Failed to write memory at']} 0x{target_addr:x}"
-            logging.error(error_msg)
+            error_msg = "Failed to write memory"
+            print(error_msg)
             raise Exception(error_msg)
 
 
@@ -265,108 +265,188 @@ def send_heartbeat():
             "server_id": SERVER_ID,
             "mem_tool_id": MEM_TOOL_ID,
             "server_ip": SERVER_IP,
-            "mem_tool_port": MEM_TOOL_PORT,
-            "version": VERSION
+            "version": VERSION,
+            "communication_mode": COMMUNICATION_MODE,
+            "mem_tool_port": MEM_TOOL_PORT if COMMUNICATION_MODE == "http" else SOCKET_PORT
         }
-        logging.debug("发送心跳包...") # Sending heartbeat package
         try:
+            print("[DEBUG] 发送心跳包...")
             response = requests.post(AUTH_SERVICE_URL, json=payload, verify=False, timeout=5)
             if response.status_code == 200:
                 response_data = response.json()
                 current_token = response_data["token"]
-                logging.info(messages_zh["Heartbeat successful, token updated"])
-
+                print(f"[INFO] {'Heartbeat successful, token updated'}")
                 # 处理内存配置信息
                 if "memory_config" in response_data:
-                    logging.info("接收到内存配置信息，开始更新...") # Received memory config info, start update
+                    print("[INFO] 接收到内存配置信息，开始更新...")
                     if memory_reader.update_memory_config(response_data["memory_config"]):
-                        logging.info(messages_zh["Memory configuration updated successfully"])
+                        print("[INFO] 内存配置更新成功")
                     else:
-                        logging.error(messages_zh["Failed to update memory configuration"])
+                        print("[ERROR] 内存配置更新失败")
             else:
-                logging.warning(f"心跳响应状态码: {response.status_code}") # Heartbeat response status code
+                print(f"[WARNING] 心跳响应状态码: {response.status_code}")
         except requests.RequestException as e:
-            logging.error(f"{messages_zh['Heartbeat failed']}: {e}")
+            print(f"[ERROR] {'Heartbeat failed'}: {e}")
         time.sleep(60)
 
+
+def monitor_process():
+    """监控游戏进程，如果进程退出则尝试重新连接新进程"""
+    global process_monitoring_active
+    print(
+        f"{'Process monitoring started'}, {'Process check interval'}: {PROCESS_CHECK_INTERVAL}秒")
+
+    while process_monitoring_active:
+        if memory_reader.selected_pid:
+            if not memory_reader.is_process_alive():
+                logging.warning("Original process exited, searching for new process")
+                # 尝试查找新进程
+                processes = memory_reader.list_squad_processes()
+                if processes:
+                    new_pid = processes[0]['pid']
+                    if new_pid != memory_reader.selected_pid:
+                        print(f"{'New process detected, reconnecting'}: PID {new_pid}")
+                        memory_reader.selected_pid = new_pid
+                        memory_reader.connect()
+        else:
+            # 如果没有选择进程，尝试选择并连接
+            try:
+                memory_reader.select_process()
+                memory_reader.connect()
+            except Exception as e:
+                print(f"尝试连接新进程失败: {str(e)}")
+
+        time.sleep(PROCESS_CHECK_INTERVAL)
 
 
 @app.route('/mem_tool/set/ticket', methods=['GET'])
 def set_ticket():
-    logging.info("Endpoint '/mem_tool/set/ticket' 被访问") # Endpoint set ticket accessed
+    print("Endpoint '/mem_tool/set/ticket' 被访问")  # Endpoint set ticket accessed
     token = request.headers.get('X-Auth-Token')
     if token != current_token or current_token is None:
-        logging.warning("未授权访问尝试") # Unauthorized access attempt
-        return jsonify({'status': 'error', 'message': messages_zh['Unauthorized']}), 403
+        logging.warning("未授权访问尝试")  # Unauthorized access attempt
+        return jsonify({'status': 'error', 'message': 'Unauthorized'}), 403
     try:
         if not memory_config_received:
-            return jsonify({'status': 'error', 'message': messages_zh['Memory configuration not received yet']}), 503
-            
+            return jsonify({'status': 'error', 'message': 'Memory configuration not received yet'}), 503
+
         team = request.args.get('team')
         value = request.args.get('value')
-        logging.info(f"请求参数：队伍={team}, 数值={value}") # Request params: team, value
+        print(f"请求参数：队伍={team}, 数值={value}")  # Request params: team, value
         if not team or not value:
-            logging.warning(messages_zh['Missing required parameters'])
-            return jsonify({'status': 'error', 'message': messages_zh['Missing required parameters']}), 400
+            logging.warning('Missing required parameters')
+            return jsonify({'status': 'error', 'message': 'Missing required parameters'}), 400
         team = int(team)
         if team not in [1, 2]:
-            logging.warning(messages_zh['Invalid team number'])
-            return jsonify({'status': 'error', 'message': messages_zh['Invalid team number']}), 400
+            logging.warning('Invalid team number')
+            return jsonify({'status': 'error', 'message': 'Invalid team number'}), 400
         memory_reader.set_ticket_value(team, value)
         current_value = memory_reader.get_ticket_value(team)
-        logging.info(f"票数已设置，当前队伍 {team} 票数为: {current_value}") # Ticket set, current team ticket value
+        print(f"票数已设置，当前队伍 {team} 票数为: {current_value}")  # Ticket set, current team ticket value
         return jsonify({
             'status': 'success',
-            'message': messages_zh['Value updated successfully'],
+            'message': 'Value updated successfully',
             'team': team,
             'value': current_value
         })
     except Exception as e:
-        logging.error(f"{messages_zh['Error in set_ticket']}: {str(e)}")
+        print(f"{'Error in set_ticket'}: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
 @app.route('/mem_tool/get/ticket', methods=['GET'])
 def get_ticket():
-    logging.info("Endpoint '/mem_tool/get/ticket' 被访问") # Endpoint get ticket accessed
+    print("Endpoint '/mem_tool/get/ticket' 被访问")  # Endpoint get ticket accessed
     token = request.headers.get('X-Auth-Token')
     if token != current_token or current_token is None:
-        logging.warning("未授权访问尝试") # Unauthorized access attempt
-        return jsonify({'status': 'error', 'message': messages_zh['Unauthorized']}), 403
+        logging.warning("未授权访问尝试")  # Unauthorized access attempt
+        return jsonify({'status': 'error', 'message': 'Unauthorized'}), 403
     try:
         if not memory_config_received:
-            return jsonify({'status': 'error', 'message': messages_zh['Memory configuration not received yet']}), 503
-            
+            return jsonify({'status': 'error', 'message': 'Memory configuration not received yet'}), 503
+
         team = request.args.get('team')
-        logging.info(f"请求参数：队伍={team}") # Request param: team
+        print(f"请求参数：队伍={team}")  # Request param: team
         if not team:
-            logging.warning(messages_zh['Missing team parameter'])
-            return jsonify({'status': 'error', 'message': messages_zh['Missing team parameter']}), 400
+            logging.warning('Missing team parameter')
+            return jsonify({'status': 'error', 'message': 'Missing team parameter'}), 400
         team = int(team)
         if team not in [1, 2]:
-            logging.warning(messages_zh['Invalid team number'])
-            return jsonify({'status': 'error', 'message': messages_zh['Invalid team number']}), 400
+            logging.warning('Invalid team number')
+            return jsonify({'status': 'error', 'message': 'Invalid team number'}), 400
         value = memory_reader.get_ticket_value(team)
-        logging.info(f"获取到队伍 {team} 的票数为: {value}") # Got team ticket value
+        print(f"获取到队伍 {team} 的票数为: {value}")  # Got team ticket value
         return jsonify({'status': 'success', 'team': team, 'value': value})
     except Exception as e:
-        logging.error(f"{messages_zh['Error in get_ticket']}: {str(e)}")
+        print(f"{'Error in get_ticket'}: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+def socket_server():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('0.0.0.0', SOCKET_PORT))
+        s.listen()
+        print(f"Socket 服务器启动，监听端口 {SOCKET_PORT}...")
+        while True:
+            conn, addr = s.accept()
+            print(f"Socket 客户端连接: {addr}")
+            try:
+                data = conn.recv(1024).decode('utf-8')
+                request = json.loads(data)
+                # 验证 Token
+                if request.get('token') != current_token:
+                    response = {'status': 'error', 'message': 'Unauthorized'}
+                else:
+                    action = request.get('action')
+                    team = request.get('team')
+                    value = request.get('value')
+                    print(f"socket request: {action} {team} {value}")
+                    # 处理请求
+                    if action == 'set_ticket':
+                        memory_reader.set_ticket_value(team, value)
+                        current_value = memory_reader.get_ticket_value(team)
+                        response = {'status': 'success', 'value': current_value}
+                    elif action == 'get_ticket':
+                        current_value = memory_reader.get_ticket_value(team)
+                        response = {'status': 'success', 'value': current_value}
+                    else:
+                        response = {'status': 'error', 'message': '无效操作'}
+                conn.send(json.dumps(response).encode('utf-8'))
+            except Exception as e:
+                print(f"Socket 请求处理失败: {str(e)}")
+                conn.send(json.dumps({'status': 'error', 'message': str(e)}).encode('utf-8'))
+            finally:
+                conn.close()
 
 
 if __name__ == '__main__':
 
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S') # Added timestamp to log
-
-    logging.info("Squad ICU Mem Tool 服务启动...") # Mem Tool service starting
+    print("[INFO] Squad ICU Mem Tool 服务启动...")
     if not memory_reader.connect():
-        logging.error(messages_zh["Failed to initialize connection to game process"])
+        print(f"[ERROR] {'Failed to initialize connection to game process'}")
     else:
-        logging.info("成功初始化与游戏进程的连接。") # Success init connection to game process
+        print("[INFO] 成功初始化与游戏进程的连接。")
 
+    # 启动心跳线程
     threading.Thread(target=send_heartbeat, daemon=True).start()
-    logging.info("心跳线程已启动。") # Heartbeat thread started
-    logging.info("等待从服务器接收内存配置...") # Waiting for memory config from server
+    print("[INFO] 心跳线程已启动。")
 
-    app.run(host='0.0.0.0', port=MEM_TOOL_PORT)
-    logging.info(f"Flask 应用运行在端口 {MEM_TOOL_PORT}...") # Flask app running on port
+    # 启动进程监控线程
+    process_monitor_thread = threading.Thread(target=monitor_process, daemon=True)
+    process_monitor_thread.start()
+
+    print("[INFO] 等待从服务器接收内存配置...")
+
+    print(f"[INFO]通信方式: {COMMUNICATION_MODE}")
+    if COMMUNICATION_MODE == 'http':
+        app.run(host='0.0.0.0', port=MEM_TOOL_PORT)
+        print(f"[INFO]web 应用运行在端口 {MEM_TOOL_PORT}...")  # Flask app running on port
+    elif COMMUNICATION_MODE == 'socket':
+        socket_thread = threading.Thread(target=socket_server, daemon=True)
+        socket_thread.start()
+        socket_thread.join()
+    else:
+        print("[ERROR] 无效的通信模式配置")
+
+    # 停止进程监控
+    process_monitoring_active = False
